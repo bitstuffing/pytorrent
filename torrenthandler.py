@@ -249,6 +249,149 @@ class TorrentHandler:
         except Exception as e:
             self.console.log(f"[red]Failed to send bitfield message to peer: {e}[/]")
 
+    def listen_for_messages(self, s, peer_ip, peer_port, peer_state):
+        try:
+            while True:
+                s.settimeout(30)
+                msg_length_bytes = self.recv_exactly(s, 4)
+                if msg_length_bytes is None:
+                    self.console.log(f"[yellow]Connection closed by peer {peer_ip}:{peer_port} while reading message length. Closing connection.[/]")
+                    break
+
+                msg_length = int.from_bytes(msg_length_bytes, byteorder='big')
+
+                if msg_length == 0:
+                    continue # keep-alive message
+
+                msg_id_bytes = self.recv_exactly(s, 1)
+                if msg_id_bytes is None:
+                    self.console.log(f"[yellow]Connection closed by peer {peer_ip}:{peer_port} while reading message ID. Closing connection.[/]")
+                    break
+
+                msg_id = msg_id_bytes[0]
+                payload_length = msg_length - 1
+                payload = self.recv_exactly(s, payload_length) if payload_length > 0 else b''
+                if payload_length > 0 and payload is None:
+                    self.console.log(f"[yellow]Connection closed by peer {peer_ip}:{peer_port} while reading payload. Closing connection.[/]")
+                    break
+
+                # handle the message according to the message ID
+                self.handle_message(s, msg_id, payload, peer_ip, peer_port, peer_state)
+
+        except socket.timeout:
+            self.console.log(f"[yellow]Socket timeout while communicating with peer {peer_ip}:{peer_port}. Retrying...[/]")
+        except Exception as e:
+            self.console.log(f"[red]Error while communicating with peer {peer_ip}:{peer_port}: {e}[/]")
+        finally:
+            s.close()
+            self.console.log(f"[blue]Connection with peer {peer_ip}:{peer_port} closed.[/]")
+
+    def handle_message(self, s, msg_id, payload, peer_ip, peer_port, peer_state):
+        if msg_id == 0:  # Choke
+            self.console.log(f"[yellow]Received 'choke' from peer {peer_ip}:{peer_port}.[/]")
+            peer_state['peer_choked'] = True
+        elif msg_id == 1:  # Unchoke
+            self.console.log(f"[green]Received 'unchoke' from peer {peer_ip}:{peer_port}.[/]")
+            peer_state['peer_choked'] = False
+            # Send requests for pieces if we are interested
+            self.request_more_pieces(s, peer_state)
+        elif msg_id == 2:  # Interested
+            self.console.log(f"[blue]Peer {peer_ip}:{peer_port} is interested in our pieces.[/]")
+        elif msg_id == 3:  # Not interested
+            self.console.log(f"[yellow]Peer {peer_ip}:{peer_port} is not interested in our pieces.[/]")
+        elif msg_id == 4:  # Have
+            piece_index = int.from_bytes(payload, byteorder='big')
+            self.console.log(f"[blue]Peer {peer_ip}:{peer_port} has piece {piece_index}.[/]")
+            peer_state['peer_pieces'].add(piece_index)
+        elif msg_id == 5:  # Bitfield
+            self.console.log(f"[blue]Received 'bitfield' from peer {peer_ip}:{peer_port}.[/]")
+            for i, byte in enumerate(payload):
+                for bit in range(8):
+                    if byte & (1 << (7 - bit)):
+                        piece_index = (i * 8) + bit
+                        if piece_index < peer_state['total_pieces']:
+                            peer_state['peer_pieces'].add(piece_index)
+        elif msg_id == 6:  # Request
+            self.console.log(f"[blue]Received 'request' from peer {peer_ip}:{peer_port}. Ignoring as we are not uploading.[/]")
+        elif msg_id == 7:  # Piece
+            index = int.from_bytes(payload[0:4], byteorder='big')
+            begin = int.from_bytes(payload[4:8], byteorder='big')
+            block = payload[8:]
+            self.console.log(f"[green]Received block for piece {index}, offset {begin} from peer {peer_ip}:{peer_port}.[/]")
+            self.store_block(index, begin, block, peer_state)
+        elif msg_id == 8:  # Cancel
+            self.console.log(f"[yellow]Received 'cancel' from peer {peer_ip}:{peer_port}. Ignoring as we are not uploading.[/]")
+        elif msg_id == 9:  # Port (DHT)
+            self.console.log(f"[yellow]Received 'port' message for DHT from peer {peer_ip}:{peer_port}. Ignoring.[/]")
+        else:
+            self.console.log(f"[red]Received unknown message ID {msg_id} from peer {peer_ip}:{peer_port}.[/]")
+
+    def store_block(self, piece_index, offset, block, peer_state):
+        if piece_index not in self.block_buffer:
+            self.block_buffer[piece_index] = {}
+
+        self.block_buffer[piece_index][offset] = block
+        peer_state['received_blocks'].add((piece_index, offset))
+
+        # Verify if we have received all blocks for the piece
+        piece_length = self.torrent_info['piece_length']
+        total_blocks = (piece_length + len(block) - 1) // len(block)
+
+        if len(self.block_buffer[piece_index]) == total_blocks:
+            # Concat all blocks to form the complete piece
+            piece_data = b''.join(self.block_buffer[piece_index][i * len(block)] for i in range(total_blocks))
+
+            # Verify the piece using the SHA-1 hash
+            expected_hash = self.torrent_info['pieces'][piece_index * 20:(piece_index + 1) * 20]
+            actual_hash = hashlib.sha1(piece_data).digest()
+
+            if actual_hash == expected_hash:
+                self.console.log(f"[green]Successfully downloaded and verified piece {piece_index}.[/]")
+                self.write_piece_to_file(piece_index, piece_data)
+                peer_state['have_pieces'].add(piece_index)
+            else:
+                self.console.log(f"[red]Hash mismatch for piece {piece_index}. Discarding corrupted piece.[/]")
+            
+            # remove the piece from the buffer (when it's used)
+            del self.block_buffer[piece_index]
+
+    def request_more_pieces(self, s, peer_state):
+        # determine the block size to request (normally 16 KiB)
+        block_size = 2**14  # 16 KiB
+        
+        for piece_index in peer_state['peer_pieces']:
+            if piece_index in peer_state['have_pieces']:
+                continue  # We already have this piece
+
+            piece_length = self.torrent_info['piece_length']
+            total_blocks = (piece_length + block_size - 1) // block_size
+
+            for block_index in range(total_blocks):
+                offset = block_index * block_size
+                length = min(block_size, piece_length - offset)
+
+                if (piece_index, offset) not in peer_state['requested_blocks']:
+                    # register the block as requested
+                    peer_state['requested_blocks'].add((piece_index, offset))
+
+                    # send message to request the block to the peer
+                    request_msg = struct.pack(">IBIII", 13, 6, piece_index, offset, length)
+                    try:
+                        s.sendall(request_msg)
+                        self.console.log(f"[cyan]Sent request for piece {piece_index}, offset {offset}, length {length}[/]")
+                    except Exception as e:
+                        self.console.log(f"[red]Failed to send request for piece {piece_index}, offset {offset}: {e}[/]")
+                        return
+
+
+    def write_piece_to_file(self, piece_index, piece_data):
+        # Write the piece data to the output file
+        file_offset = piece_index * self.torrent_info['piece_length']
+        with open(os.path.join(self.download_directory, "output_file"), "r+b") as f:
+            f.seek(file_offset)
+            f.write(piece_data)
+
+
 if __name__ == "__main__":
     torrent_path = "example.torrent"
     handler = TorrentHandler(torrent_path)
