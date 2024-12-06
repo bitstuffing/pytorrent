@@ -12,6 +12,7 @@ import config
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import struct
 import time
+from datetime import datetime, timedelta
 import sys
 import threading
 from threading import Thread
@@ -26,14 +27,17 @@ class TorrentHandler:
     def __init__(self, torrent_path):
         self.console = Console()
         self.block_buffer = defaultdict(lambda: {})
-        self.download_directory = config.DOWNLOAD_PATH
         self.trackers_url = "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
         self.peer_id = self.generate_peer_id().encode('utf-8')
         self.console.log(f"Generated Peer ID: {self.peer_id.decode('utf-8')}")
         
         self.console.print("[bold magenta]Parsing .torrent file...[/]")
         self.torrent_info = self.parse_torrent_file(torrent_path)
-        self.total_pieces = len(self.torrent_info['pieces']) // 20  # Cada hash SHA1 tiene 20 bytes
+        self.total_pieces = len(self.torrent_info['pieces']) // 20  # each SHA1 hash has 20 bytes
+
+        self.download_directory = os.path.join(config.DOWNLOAD_PATH, self.torrent_info['name'])
+        if not os.path.exists(self.download_directory):
+            os.makedirs(self.download_directory)
 
         # Progress tracking
         self.progress_file = os.path.join(self.download_directory, "download.progress")
@@ -45,6 +49,7 @@ class TorrentHandler:
         self.file_write_lock = Lock()
 
         self.load_progress()
+        self.failed_peers = {}
 
     def print_download_status(self):
         with self.downloaded_pieces_lock:
@@ -218,26 +223,42 @@ class TorrentHandler:
 
         successful_peers = []
 
-        with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as executor:
-            future_to_peer = {
-                executor.submit(self.connect_to_peer, peer_ip, peer_port, info_hash): (peer_ip, peer_port)
-                for peer_ip, peer_port in peers
-            }
+        # Separate peers into new and failed
+        fresh_peers = [p for p in peers if p[0] not in self.failed_peers]
+        failed_peers = [p for p in peers if p[0] in self.failed_peers]
 
-            for future in as_completed(future_to_peer):
-                peer_ip, peer_port = future_to_peer[future]
-                result = future.result()
-                if result:
-                    successful_peers.append((peer_ip, peer_port))
+        # Combine fresh peers first and then failed ones
+        ordered_peers = fresh_peers + failed_peers
+
+        def connect_peer(peer_ip, peer_port):
+            if self.connect_to_peer(peer_ip, peer_port, info_hash):
+                successful_peers.append((peer_ip, peer_port))
+
+        with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as executor:
+            futures = []
+            for peer_ip, peer_port in ordered_peers:
+                if self.is_download_complete():
+                    break
+                futures.append(executor.submit(connect_peer, peer_ip, peer_port))
+
+            for future in as_completed(futures):
+                future.result()  # This will raise any exception if the worker failed
 
         self.console.print(f"[green]Successfully connected to {len(successful_peers)} peers.[/]")
-
 
     def connect_to_peer(self, peer_ip, peer_port, info_hash, retry_attempts=3):
         # Check if download is already complete before proceeding
         if self.is_download_complete():
             self.console.print("[green]Download is complete. Skipping peer connection.[/]")
             return False
+
+        # Avoid reconnection to failed peers too soon
+        now = datetime.now()
+        if peer_ip in self.failed_peers:
+            next_retry_time = self.failed_peers[peer_ip]['next_retry']
+            if now < next_retry_time:
+                self.console.log(f"[yellow]Skipping connection to peer {peer_ip}:{peer_port} until {next_retry_time}[/]")
+                return False
 
         peer_state = {
             'peer_choked': True,
@@ -247,6 +268,7 @@ class TorrentHandler:
             'requested_blocks': set(),
             'received_blocks': set(),
         }
+
         for attempt in range(retry_attempts):
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -260,13 +282,13 @@ class TorrentHandler:
                 if not peer_handshake:
                     self.console.log(f"[red]Failed to receive handshake from {peer_ip}:{peer_port}[/]")
                     s.close()
-                    return False
+                    continue
 
                 # Verify handshake
                 if peer_handshake[28:48] != info_hash:
                     self.console.log(f"[red]Info hash mismatch with {peer_ip}:{peer_port}[/]")
                     s.close()
-                    return False
+                    continue
 
                 # Send 'interested' message
                 self.send_interested(s, peer_state)
@@ -276,12 +298,21 @@ class TorrentHandler:
 
                 s.close()
                 return True
+
             except Exception as e:
                 self.console.log(f"[red]Error connecting to peer {peer_ip}:{peer_port}: {e}[/]")
-                continue
 
-        self.console.log(f"[red]Failed to connect to peer {peer_ip}:{peer_port} after {retry_attempts} attempts.[/]")
+        # Mark this peer as failed and schedule next retry after an increasing interval
+        retry_count = self.failed_peers.get(peer_ip, {}).get('retry_count', 0) + 1
+        retry_delay = min(5 * retry_count, 30)  # Incremental delay up to a max of 30 minutes
+        self.failed_peers[peer_ip] = {
+            'next_retry': now + timedelta(minutes=retry_delay),
+            'retry_count': retry_count
+        }
+
+        self.console.log(f"[red]Failed to connect to peer {peer_ip}:{peer_port} after {retry_attempts} attempts. Will retry in {retry_delay} minutes.[/]")
         return False
+
     
     def is_download_complete(self):
         with self.downloaded_pieces_lock:
