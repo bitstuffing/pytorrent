@@ -16,6 +16,7 @@ import sys
 import threading
 from urllib.parse import quote
 import random
+import json
 
 sys.set_int_max_str_digits(10000)
 
@@ -30,7 +31,41 @@ class TorrentHandler:
         
         self.console.print("[bold magenta]Parsing .torrent file...[/]")
         self.torrent_info = self.parse_torrent_file(torrent_path)
-        self.total_pieces = len(self.torrent_info['pieces']) // 20  # SHA-1 hashes are 20 bytes long
+        self.total_pieces = len(self.torrent_info['pieces']) // 20  # Cada hash SHA1 tiene 20 bytes
+
+        # Progress tracking
+        self.progress_file = os.path.join(self.download_directory, "download.progress")
+        self.load_progress()
+
+    # Load progress from file if it exists
+    def load_progress(self):
+        if os.path.exists(self.progress_file):
+            with open(self.progress_file, 'r') as f:
+                progress_data = json.load(f)
+                self.downloaded_pieces = set(progress_data.get('downloaded_pieces', []))
+                self.block_buffer = defaultdict(
+                    lambda: {},
+                    {
+                        int(k): {int(offset): bytes.fromhex(block) for offset, block in v.items()}
+                        for k, v in progress_data.get('block_buffer', {}).items()
+                    }
+                )
+        else:
+            self.downloaded_pieces = set()
+
+
+    # Save current progress to file
+    def save_progress(self):
+        progress_data = {
+            'downloaded_pieces': list(self.downloaded_pieces),
+            'block_buffer': {
+                k: {offset: block.hex() for offset, block in v.items()}
+                for k, v in self.block_buffer.items()
+            }
+        }
+        with open(self.progress_file, 'w') as f:
+            json.dump(progress_data, f)
+
 
     def parse_torrent_file(self, torrent_path):
         with open(torrent_path, 'rb') as f:
@@ -149,10 +184,9 @@ class TorrentHandler:
         return peers
 
     def connect_to_peers(self, peers):
-        max_workers = 10
         info_hash = self.torrent_info['info_hash']
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=config.MAX_WORKERS) as executor:
             future_to_peer = {
                 executor.submit(self.connect_to_peer, peer_ip, peer_port, info_hash): (peer_ip, peer_port)
                 for peer_ip, peer_port in peers
@@ -261,7 +295,7 @@ class TorrentHandler:
                 msg_length = int.from_bytes(msg_length_bytes, byteorder='big')
 
                 if msg_length == 0:
-                    continue # keep-alive message
+                    continue  # keep-alive message
 
                 msg_id_bytes = self.recv_exactly(s, 1)
                 if msg_id_bytes is None:
@@ -270,10 +304,15 @@ class TorrentHandler:
 
                 msg_id = msg_id_bytes[0]
                 payload_length = msg_length - 1
-                payload = self.recv_exactly(s, payload_length) if payload_length > 0 else b''
-                if payload_length > 0 and payload is None:
-                    self.console.log(f"[yellow]Connection closed by peer {peer_ip}:{peer_port} while reading payload. Closing connection.[/]")
-                    break
+
+                # Initialize payload as an empty byte string, to ensure it has a value
+                payload = b''
+
+                if payload_length > 0:
+                    payload = self.recv_exactly(s, payload_length)
+                    if payload is None:
+                        self.console.log(f"[yellow]Connection closed by peer {peer_ip}:{peer_port} while reading payload. Closing connection.[/]")
+                        break
 
                 # handle the message according to the message ID
                 self.handle_message(s, msg_id, payload, peer_ip, peer_port, peer_state)
@@ -330,6 +369,23 @@ class TorrentHandler:
         if piece_index not in self.block_buffer:
             self.block_buffer[piece_index] = {}
 
+        # Store the block in the buffer
+        self.block_buffer[piece_index][offset] = block
+        peer_state['received_blocks'].add((piece_index, offset))
+
+        # Update console with block received
+        self.console.log(f"[green]Stored block for piece {piece_index}, offset {offset}. Blocks received: {len(self.block_buffer[piece_index])}/{self.get_total_blocks(piece_index)}[/]")
+
+        # Check if the entire piece has been received
+        if len(self.block_buffer[piece_index]) == self.get_total_blocks(piece_index):
+            self.verify_and_store_piece(piece_index, peer_state)
+
+        # Save progress to file
+        self.save_progress()
+
+        if piece_index not in self.block_buffer:
+            self.block_buffer[piece_index] = {}
+
         self.block_buffer[piece_index][offset] = block
         peer_state['received_blocks'].add((piece_index, offset))
 
@@ -355,13 +411,28 @@ class TorrentHandler:
             # remove the piece from the buffer (when it's used)
             del self.block_buffer[piece_index]
 
-    def request_more_pieces(self, s, peer_state):
-        # determine the block size to request (normally 16 KiB)
+    def get_total_blocks(self, piece_index):
+        # Calculate the total number of blocks for a given piece
+        piece_length = self.torrent_info['piece_length']
         block_size = 2**14  # 16 KiB
-        
+        if piece_index == self.total_pieces - 1:
+            # The last piece may be smaller than the others
+            total_length = sum(file['length'] for file in self.torrent_info['files'])
+            last_piece_length = total_length - (piece_index * piece_length)
+            return (last_piece_length + block_size - 1) // block_size
+        else:
+            return (piece_length + block_size - 1) // block_size
+
+    def request_more_pieces(self, s, peer_state):
+        if peer_state['peer_choked']:
+            self.console.log(f"[yellow]Peer is choked. Cannot request more pieces at this moment.[/]")
+            return
+
+        block_size = 2**14  # 16 KiB
+
         for piece_index in peer_state['peer_pieces']:
             if piece_index in peer_state['have_pieces']:
-                continue  # We already have this piece
+                continue
 
             piece_length = self.torrent_info['piece_length']
             total_blocks = (piece_length + block_size - 1) // block_size
@@ -370,26 +441,129 @@ class TorrentHandler:
                 offset = block_index * block_size
                 length = min(block_size, piece_length - offset)
 
-                if (piece_index, offset) not in peer_state['requested_blocks']:
-                    # register the block as requested
-                    peer_state['requested_blocks'].add((piece_index, offset))
+                if (piece_index, offset) in peer_state['requested_blocks']:
+                    continue
 
-                    # send message to request the block to the peer
-                    request_msg = struct.pack(">IBIII", 13, 6, piece_index, offset, length)
-                    try:
-                        s.sendall(request_msg)
-                        self.console.log(f"[cyan]Sent request for piece {piece_index}, offset {offset}, length {length}[/]")
-                    except Exception as e:
-                        self.console.log(f"[red]Failed to send request for piece {piece_index}, offset {offset}: {e}[/]")
+                peer_state['requested_blocks'].add((piece_index, offset))
+
+                request_msg = struct.pack(">IBIII", 13, 6, piece_index, offset, length)
+                try:
+                    s.sendall(request_msg)
+                    self.console.log(f"[cyan]Sent request for piece {piece_index}, offset {offset}, length {length}[/]")
+                except Exception as e:
+                    self.console.log(f"[red]Failed to send request for piece {piece_index}, offset {offset}: {e}[/]")
+                    return
+
+                self.listen_for_block_response(s, peer_state, piece_index, offset)
+
+                if peer_state['peer_choked']:
+                    self.console.log(f"[yellow]Peer choked us. Stopping further requests for now.[/]")
+                    return
+
+            if len(self.block_buffer[piece_index]) == total_blocks:
+                self.verify_and_store_piece(piece_index, peer_state)
+
+    def listen_for_block_response(self, s, peer_state, piece_index, offset):
+        try:
+            s.settimeout(30)
+            while True:
+                msg_length_bytes = self.recv_exactly(s, 4)
+                if msg_length_bytes is None:
+                    self.console.log(f"[yellow]Connection closed by peer while waiting for block response. Closing connection.[/]")
+                    return
+
+                msg_length = int.from_bytes(msg_length_bytes, byteorder='big')
+                if msg_length == 0:
+                    continue
+
+                msg_id_bytes = self.recv_exactly(s, 1)
+                if msg_id_bytes is None:
+                    self.console.log(f"[yellow]Connection closed by peer while reading message ID. Closing connection.[/]")
+                    return
+
+                msg_id = msg_id_bytes[0]
+
+                if msg_id == 7:  # 'piece' message
+                    payload = self.recv_exactly(s, msg_length - 1)
+                    if payload is None:
+                        self.console.log(f"[yellow]Connection closed by peer while reading payload. Closing connection.[/]")
                         return
 
+                    index = int.from_bytes(payload[0:4], byteorder='big')
+                    begin = int.from_bytes(payload[4:8], byteorder='big')
+                    block = payload[8:]
 
+                    if index == piece_index and begin == offset:
+                        self.console.log(f"[green]Received block for piece {index}, offset {begin}.[/]")
+                        self.store_block(index, begin, block, peer_state)
+                        return
+                else:
+                    self.handle_message(s, msg_id, payload, "", "", peer_state)
+
+        except socket.timeout:
+            self.console.log(f"[yellow]Timeout while waiting for block response from peer.[/]")
+
+    def verify_and_store_piece(self, piece_index, peer_state):
+        piece_length = self.torrent_info['piece_length']
+        total_blocks = self.get_total_blocks(piece_index)
+
+        # Concatenate all blocks to form the complete piece
+        piece_data = b''.join(self.block_buffer[piece_index][i * (2**14)] for i in range(total_blocks))
+
+        # Verify the integrity of the piece using SHA1
+        expected_hash = self.torrent_info['pieces'][piece_index * 20:(piece_index + 1) * 20]
+        actual_hash = hashlib.sha1(piece_data).digest()
+
+        if actual_hash == expected_hash:
+            self.console.log(f"[green]Successfully downloaded and verified piece {piece_index}.[/]")
+            self.write_piece_to_file(piece_index, piece_data)
+            peer_state['have_pieces'].add(piece_index)
+            self.downloaded_pieces.add(piece_index)
+        else:
+            self.console.log(f"[red]Hash mismatch for piece {piece_index}. Discarding corrupted piece.[/]")
+
+        # Remove the buffer for the processed piece
+        del self.block_buffer[piece_index]
+
+        # Save progress to file
+        self.save_progress()
+
+
+    # Write the piece data to the output file
     def write_piece_to_file(self, piece_index, piece_data):
-        # Write the piece data to the output file
-        file_offset = piece_index * self.torrent_info['piece_length']
-        with open(os.path.join(self.download_directory, "output_file"), "r+b") as f:
-            f.seek(file_offset)
-            f.write(piece_data)
+        piece_length = self.torrent_info['piece_length']
+        offset_in_piece = 0
+
+        for file_info in self.torrent_info['files']:
+            # Calculate the path for the output file
+            file_path = os.path.join(self.download_directory, file_info['path'])
+
+            # Ensure that the directory structure exists
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+            # Calculate file bounds in terms of torrent piece indices
+            file_start = offset_in_piece
+            file_end = file_start + file_info['length']
+
+            # Determine the intersection of the current piece with the current file
+            piece_start = piece_index * piece_length
+            piece_end = piece_start + len(piece_data)
+
+            intersect_start = max(file_start, piece_start)
+            intersect_end = min(file_end, piece_end)
+
+            if intersect_start < intersect_end:  # There is an overlap
+                file_offset = intersect_start - file_start
+                piece_offset = intersect_start - piece_start
+                write_length = intersect_end - intersect_start
+
+                # Open the file in read/write mode, creating it if necessary
+                with open(file_path, "r+b" if os.path.exists(file_path) else "wb") as f:
+                    f.seek(file_offset)
+                    f.write(piece_data[piece_offset:piece_offset + write_length])
+
+            offset_in_piece += file_info['length']
+
 
 
 if __name__ == "__main__":
