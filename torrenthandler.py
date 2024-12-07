@@ -24,10 +24,9 @@ sys.set_int_max_str_digits(10000)
 class TorrentHandler(HandshakeHandler):
     def __init__(self, torrent_path):
         self.console = Console()
+        super().__init__(self.console)
         self.block_buffer = defaultdict(lambda: {})
         self.trackers_url = "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt"
-        self.peer_id = self.generate_peer_id().encode('utf-8')
-        self.console.log(f"Generated Peer ID: {self.peer_id.decode('utf-8')}")
         
         self.console.print("[bold magenta]Parsing .torrent file...[/]")
         self.torrent_info = self.parse_torrent_file(torrent_path)
@@ -132,9 +131,6 @@ class TorrentHandler(HandshakeHandler):
             'name': name,  # Add this line
             'length': sum(file['length'] for file in files)  # Total length
         }
-    
-    def generate_peer_id(self):
-        return '-PC0001-' + ''.join([str(random.randint(0, 9)) for _ in range(12)])
 
     def fetch_trackers(self, url): 
         announce_list = []
