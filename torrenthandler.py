@@ -11,19 +11,17 @@ from collections import defaultdict
 import config
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import struct
-import time
 from datetime import datetime, timedelta
 import sys
-import threading
-from threading import Thread
 from urllib.parse import quote
 import random
 import json
 from threading import Lock
+from handshakehandler import HandshakeHandler
 
 sys.set_int_max_str_digits(10000)
 
-class TorrentHandler:
+class TorrentHandler(HandshakeHandler):
     def __init__(self, torrent_path):
         self.console = Console()
         self.block_buffer = defaultdict(lambda: {})
@@ -246,13 +244,10 @@ class TorrentHandler:
 
         self.console.print(f"[green]Successfully connected to {len(successful_peers)} peers.[/]")
 
-    def connect_to_peer(self, peer_ip, peer_port, info_hash, retry_attempts=3):
-        # Check if download is already complete before proceeding
-        if self.is_download_complete():
-            self.console.print("[green]Download is complete. Skipping peer connection.[/]")
-            return False
-
-        # Avoid reconnection to failed peers too soon
+    """
+    Establishes a connection to a peer
+    """
+    def connect_to_peer(self, peer_ip, peer_port, info_hash, retry_attempts=1):
         now = datetime.now()
         if peer_ip in self.failed_peers:
             next_retry_time = self.failed_peers[peer_ip]['next_retry']
@@ -260,7 +255,122 @@ class TorrentHandler:
                 self.console.log(f"[yellow]Skipping connection to peer {peer_ip}:{peer_port} until {next_retry_time}[/]")
                 return False
 
+        for attempt in range(retry_attempts):
+            try:
+                self.console.log(f"[blue]Attempting connection to {peer_ip}:{peer_port} (Attempt {attempt + 1}/{retry_attempts})[/]")
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(10)
+                s.connect((peer_ip, peer_port))
+
+                # try encrypted handshake first
+                result = self.encrypted_handshake(s, info_hash)
+                if result is not None:
+                    # successful encrypted handshake
+                    rc4_in = result['rc4_in']
+                    rc4_out = result['rc4_out']
+                    IA = result['initial_bt_handshake']
+
+                    # send extended handshake
+                    bt_handshake = (
+                        bytes([19]) + b'BitTorrent protocol' +
+                        b'\x00' * 8 + info_hash + self.peer_id
+                    )
+                    encrypted_handshake = rc4_out.crypt(bt_handshake)
+                    s.sendall(encrypted_handshake)
+
+                    # receive extended handshake
+                    encrypted_response = self.recv_exactly(s, len(bt_handshake))
+                    if not encrypted_response:
+                        raise Exception("Failed to receive encrypted response after handshake.")
+                    peer_handshake = rc4_in.crypt(encrypted_response)
+                    if peer_handshake[28:48] != info_hash:
+                        raise Exception("Peer responded with incorrect info hash.")
+
+                    self.console.log("[green]Successful encrypted handshake. Starting communication with peer.[/]")
+                    # Start communication with peer using encrypted handshake
+                    self.start_peer_communication(s, peer_ip, peer_port, info_hash, rc4_in, rc4_out)
+                    return True
+                else:
+                    self.console.log("[yellow]Peer does not support encrypted handshake. Retrying with plain handshake.[/]")
+                    s.close()
+                    if config.ENABLE_PLAIN: # TODO retry with plain handshake, now disabled to get working encrypted handshake
+                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        s.settimeout(10)
+                        s.connect((peer_ip, peer_port))
+                        if self.plain_handshake(s, info_hash):
+                            self.console.log("[green]Plain handshake successful. Starting communication with peer.[/]")
+                            self.start_peer_communication(s, peer_ip, peer_port, info_hash, None, None)
+                            return True
+                        else:
+                            self.console.log("[red]Peer does not support plain handshake. Jumping to next peer...[/]")
+                            s.close()
+                            return False
+
+            except Exception as e:
+                self.console.log(f"[red]Error connecting to peer {peer_ip}:{peer_port}: {e}[/]")
+
+        # Mark this peer as failed and schedule next retry
+        retry_count = self.failed_peers.get(peer_ip, {}).get('retry_count', 0) + 1
+        retry_delay = min(5 * retry_count, 30)  # Incremental delay up to 30 minutes
+        self.failed_peers[peer_ip] = {
+            'next_retry': now + timedelta(minutes=retry_delay),
+            'retry_count': retry_count
+        }
+
+        self.console.log(f"[red]Failed to connect to peer {peer_ip}:{peer_port} after {retry_attempts} attempts. Will retry in {retry_delay} minutes.[/]")
+        return False
+    
+    def is_download_complete(self):
+        with self.downloaded_pieces_lock:
+            return len(self.downloaded_pieces) == self.total_pieces
+
+    def recv_remaining_data(self, s):
+        s.settimeout(10)
+        data = b''
+        try:
+            while True:
+                part = s.recv(4096)
+                if not part:
+                    break
+                data += part
+                if len(data) > 1024:
+                    break
+        except socket.timeout:
+            pass
+        return data
+
+    """Simple RC4 implementation for MSE/PE"""
+    def rc4_crypt(self, data, key):
+        S = list(range(256))
+        j = 0
+        
+        # KSA (Key Scheduling Algorithm)
+        for i in range(256):
+            j = (j + S[i] + key[i % len(key)]) % 256
+            S[i], S[j] = S[j], S[i]
+        
+        # PRGA (Pseudo-Random Generation Algorithm)
+        i = j = 0
+        result = bytearray()
+        
+        for byte in data:
+            i = (i + 1) % 256
+            j = (j + S[i]) % 256
+            S[i], S[j] = S[j], S[i]
+            k = S[(S[i] + S[j]) % 256]
+            result.append(byte ^ k)
+            
+        return bytes(result)
+
+    """
+    Handles communication with a peer after the handshake.
+    If encryption_key is provided, encrypt/decrypt messages.
+    """
+    def start_peer_communication(self, socket, peer_ip, peer_port, info_hash, rc4_in=None, rc4_out=None):
         peer_state = {
+            'socket': socket,
+            'rc4_in': rc4_in,
+            'rc4_out': rc4_out,
             'peer_choked': True,
             'peer_pieces': set(),
             'have_pieces': self.downloaded_pieces.copy(),
@@ -269,61 +379,10 @@ class TorrentHandler:
             'received_blocks': set(),
         }
 
-        for attempt in range(retry_attempts):
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(10)
-                s.connect((peer_ip, peer_port))
+        # Send interested message and start message exchange
+        self.send_interested(socket, peer_state)
+        self.listen_for_messages(socket, peer_ip, peer_port, peer_state)
 
-                # Perform handshake
-                handshake = self.create_handshake(info_hash)
-                s.sendall(handshake)
-                peer_handshake = self.recv_exactly(s, len(handshake))
-                if not peer_handshake:
-                    self.console.log(f"[red]Failed to receive handshake from {peer_ip}:{peer_port}[/]")
-                    s.close()
-                    continue
-
-                # Verify handshake
-                if peer_handshake[28:48] != info_hash:
-                    self.console.log(f"[red]Info hash mismatch with {peer_ip}:{peer_port}[/]")
-                    s.close()
-                    continue
-
-                # Send 'interested' message
-                self.send_interested(s, peer_state)
-
-                # Start listening to messages from peer
-                self.listen_for_messages(s, peer_ip, peer_port, peer_state)
-
-                s.close()
-                return True
-
-            except Exception as e:
-                self.console.log(f"[red]Error connecting to peer {peer_ip}:{peer_port}: {e}[/]")
-
-        # Mark this peer as failed and schedule next retry after an increasing interval
-        retry_count = self.failed_peers.get(peer_ip, {}).get('retry_count', 0) + 1
-        retry_delay = min(5 * retry_count, 30)  # Incremental delay up to a max of 30 minutes
-        self.failed_peers[peer_ip] = {
-            'next_retry': now + timedelta(minutes=retry_delay),
-            'retry_count': retry_count
-        }
-
-        self.console.log(f"[red]Failed to connect to peer {peer_ip}:{peer_port} after {retry_attempts} attempts. Will retry in {retry_delay} minutes.[/]")
-        return False
-
-    
-    def is_download_complete(self):
-        with self.downloaded_pieces_lock:
-            return len(self.downloaded_pieces) == self.total_pieces
-
-    def create_handshake(self, info_hash):
-        pstr = b'BitTorrent protocol'
-        pstrlen = len(pstr)
-        reserved = b'\x00' * 8
-        handshake = struct.pack(f'>B{pstrlen}s8s20s20s', pstrlen, pstr, reserved, info_hash, self.peer_id)
-        return handshake
 
     def recv_exactly(self, sock, num_bytes):
         buf = b''
@@ -337,9 +396,23 @@ class TorrentHandler:
                 return None
         return buf
 
+    def send_message(self, s, message, peer_state):
+        if peer_state['rc4_out']:
+            encrypted_message = peer_state['rc4_out'].crypt(message)
+            s.sendall(encrypted_message)
+        else:
+            s.sendall(message)
+
+    def recv_message(self, s, num_bytes, peer_state):
+        data = self.recv_exactly(s, num_bytes)
+        if data and peer_state['rc4_in']:
+            decrypted_data = peer_state['rc4_in'].crypt(data)
+            return decrypted_data
+        return data
+
     def send_interested(self, s, peer_state):
         interested_msg = b'\x00\x00\x00\x01\x02'
-        s.sendall(interested_msg)
+        self.send_message(s, interested_msg, peer_state)
         self.console.log(f"[blue]Sent 'interested' message to peer.[/]")
 
     def send_bitfield(self, s, peer_state):
@@ -357,7 +430,7 @@ class TorrentHandler:
 
         bitfield_msg = struct.pack(">I", len(bitfield) + 1) + b'\x05' + bitfield
         try:
-            s.sendall(bitfield_msg)
+            self.send_message(s, bitfield_msg, peer_state)
             self.console.log(f"[blue]Sent bitfield message to peer.[/]")
         except Exception as e:
             self.console.log(f"[red]Failed to send bitfield message to peer: {e}[/]")
@@ -366,7 +439,7 @@ class TorrentHandler:
         try:
             while True:
                 s.settimeout(30)
-                msg_length_bytes = self.recv_exactly(s, 4)
+                msg_length_bytes = self.recv_message(s, 4, peer_state)
                 if msg_length_bytes is None:
                     self.console.log(f"[yellow]Connection closed by peer {peer_ip}:{peer_port} while reading message length. Closing connection.[/]")
                     break
@@ -376,7 +449,7 @@ class TorrentHandler:
                 if msg_length == 0:
                     continue  # keep-alive message
 
-                msg_id_bytes = self.recv_exactly(s, 1)
+                msg_id_bytes = self.recv_message(s, 1, peer_state)
                 if msg_id_bytes is None:
                     self.console.log(f"[yellow]Connection closed by peer {peer_ip}:{peer_port} while reading message ID. Closing connection.[/]")
                     break
@@ -388,7 +461,7 @@ class TorrentHandler:
                 payload = b''
 
                 if payload_length > 0:
-                    payload = self.recv_exactly(s, payload_length)
+                    payload = self.recv_message(s, payload_length, peer_state)
                     if payload is None:
                         self.console.log(f"[yellow]Connection closed by peer {peer_ip}:{peer_port} while reading payload. Closing connection.[/]")
                         break
@@ -473,7 +546,7 @@ class TorrentHandler:
 
             request_msg = struct.pack('>IBIII', 13, 6, piece_index, offset, block_length)
             try:
-                s.sendall(request_msg)
+                self.send_message(s, request_msg, peer_state)
                 peer_state['requested_blocks'].add((piece_index, offset))
             except Exception as e:
                 self.console.log(f"[red]Error requesting block to peer: {e}[/]")
@@ -483,7 +556,7 @@ class TorrentHandler:
         try:
             s.settimeout(30)
             while True:
-                msg_length_bytes = self.recv_exactly(s, 4)
+                msg_length_bytes = self.recv_message(s, 4, peer_state)
                 if msg_length_bytes is None:
                     self.console.log(f"[yellow]Connection closed by peer while waiting for block response. Closing connection.[/]")
                     return
@@ -492,7 +565,7 @@ class TorrentHandler:
                 if msg_length == 0:
                     continue
 
-                msg_id_bytes = self.recv_exactly(s, 1)
+                msg_id_bytes = self.recv_message(s, 1, peer_state)
                 if msg_id_bytes is None:
                     self.console.log(f"[yellow]Connection closed by peer while reading message ID. Closing connection.[/]")
                     return
@@ -500,7 +573,7 @@ class TorrentHandler:
                 msg_id = msg_id_bytes[0]
 
                 if msg_id == 7:  # 'piece' message
-                    payload = self.recv_exactly(s, msg_length - 1)
+                    payload = self.recv_message(s, msg_length - 1, peer_state)
                     if payload is None:
                         self.console.log(f"[yellow]Connection closed by peer while reading payload. Closing connection.[/]")
                         return
@@ -554,7 +627,7 @@ class TorrentHandler:
 
             request_msg = struct.pack('>IBIII', 13, 6, piece_index, offset, block_length)
             try:
-                peer_state['socket'].sendall(request_msg)
+                self.send_message(peer_state['socket'], request_msg, peer_state)
                 peer_state['requested_blocks'].add((piece_index, offset))
             except Exception as e:
                 self.console.log(f"[red]Error requesting block to peer: {e}[/]")
