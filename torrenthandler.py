@@ -17,7 +17,7 @@ from urllib.parse import quote
 import random
 import json
 from threading import Lock
-from handshakehandler import HandshakeHandler
+from handshakehandler import HandshakeHandler, RC4State
 
 sys.set_int_max_str_digits(10000)
 
@@ -264,25 +264,9 @@ class TorrentHandler(HandshakeHandler):
                     # successful encrypted handshake
                     rc4_in = result['rc4_in']
                     rc4_out = result['rc4_out']
-                    IA = result['initial_bt_handshake']
+                    
+                    self.console.log(f"[green]Successful encrypted handshake with peer {peer_ip}. Starting communication with peer.[/]")
 
-                    # send extended handshake
-                    bt_handshake = (
-                        bytes([19]) + b'BitTorrent protocol' +
-                        b'\x00' * 8 + info_hash + self.peer_id
-                    )
-                    encrypted_handshake = rc4_out.crypt(bt_handshake)
-                    s.sendall(encrypted_handshake)
-
-                    # receive extended handshake
-                    encrypted_response = self.recv_exactly(s, len(bt_handshake))
-                    if not encrypted_response:
-                        raise Exception("Failed to receive encrypted response after handshake.")
-                    peer_handshake = rc4_in.crypt(encrypted_response)
-                    if peer_handshake[28:48] != info_hash:
-                        raise Exception("Peer responded with incorrect info hash.")
-
-                    self.console.log("[green]Successful encrypted handshake. Starting communication with peer.[/]")
                     # Start communication with peer using encrypted handshake
                     self.start_peer_communication(s, peer_ip, peer_port, info_hash, rc4_in, rc4_out)
                     return True
@@ -384,7 +368,9 @@ class TorrentHandler(HandshakeHandler):
         buf = b''
         while len(buf) < num_bytes:
             try:
-                data = sock.recv(num_bytes - len(buf))
+                #data = sock.recv(num_bytes - len(buf))
+                # fragment it to avoid blocking
+                data = sock.recv(min(4096, num_bytes - len(buf)))
                 if not data:
                     return None
                 buf += data
@@ -394,7 +380,8 @@ class TorrentHandler(HandshakeHandler):
 
     def send_message(self, s, message, peer_state):
         if peer_state['rc4_out']:
-            encrypted_message = peer_state['rc4_out'].crypt(message)
+            rc4crypter = peer_state['rc4_out'] # Use RC4 to encrypt the message
+            encrypted_message = rc4crypter.crypt(message)
             s.sendall(encrypted_message)
         else:
             s.sendall(message)
@@ -402,7 +389,8 @@ class TorrentHandler(HandshakeHandler):
     def recv_message(self, s, num_bytes, peer_state):
         data = self.recv_exactly(s, num_bytes)
         if data and peer_state['rc4_in']:
-            decrypted_data = peer_state['rc4_in'].crypt(data)
+            rc4crypter = peer_state['rc4_in'] # Use RC4 to decrypt the message
+            decrypted_data = rc4crypter.crypt(data)
             return decrypted_data
         return data
 
@@ -441,11 +429,14 @@ class TorrentHandler(HandshakeHandler):
                     break
 
                 msg_length = int.from_bytes(msg_length_bytes, byteorder='big')
+                self.console.log(f"Received message length: {msg_length}")
 
                 if msg_length == 0:
                     continue  # keep-alive message
 
                 msg_id_bytes = self.recv_message(s, 1, peer_state)
+                self.console.log(f"Received message ID: {msg_id_bytes[0]}")
+
                 if msg_id_bytes is None:
                     self.console.log(f"[yellow]Connection closed by peer {peer_ip}:{peer_port} while reading message ID. Closing connection.[/]")
                     break
@@ -497,6 +488,8 @@ class TorrentHandler(HandshakeHandler):
             self.store_block(piece_index, offset, block, peer_state)
             # continue listening for more blocks
             self.request_more_pieces(s, peer_state)
+        else:
+            self.console.log(f"[yellow]Received unknown message ID: {msg_id}[/]")
         # TODO: Handle other message types here
 
     def store_block(self, piece_index, offset, block, peer_state):
@@ -550,14 +543,15 @@ class TorrentHandler(HandshakeHandler):
 
     def listen_for_block_response(self, s, peer_state, piece_index, offset):
         try:
-            s.settimeout(30)
+            s.settimeout(config.MAX_TIMEOUT_PER_CONNECTION)
             while True:
                 msg_length_bytes = self.recv_message(s, 4, peer_state)
                 if msg_length_bytes is None:
                     self.console.log(f"[yellow]Connection closed by peer while waiting for block response. Closing connection.[/]")
                     return
 
-                msg_length = int.from_bytes(msg_length_bytes, byteorder='big')
+                #msg_length = int.from_bytes(msg_length_bytes, byteorder='big') # 2973387785 is so big, it's not possible to convert to int
+                msg_length = struct.unpack('>I', msg_length_bytes)[0]
                 if msg_length == 0:
                     continue
 
