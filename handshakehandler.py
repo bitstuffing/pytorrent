@@ -128,9 +128,10 @@ class HandshakeHandler:
             rc4_out.discard(1024)
             rc4_in.discard(1024)
 
-            # First encrypt and send our message
+            # === 4) Send ENCRYPT(VC, crypto_provide, PadC, IA)
             VC = b'\x00' * 8
-            crypto_provide = struct.pack(">I", 2)  # Only offer RC4 (0x02)
+            # we offer RC4 (0x02). (NOTE: study if it could be in a future 0x03 to offer plaintext + RC4)
+            crypto_provide = struct.pack(">I", 0x02)
             PadC_length = random.randint(0, 512)
             PadC = os.urandom(PadC_length)
             
@@ -152,108 +153,77 @@ class HandshakeHandler:
             self.console.log(f"[cyan]Sending encrypted message len={len(encrypted_message)}")
             s.sendall(encrypted_message)
 
-            # Now receive and decrypt peer's message
-            # First, search for encrypted VC pattern
-            rc4_test = RC4State(keyB)
-            rc4_test.discard(1024)
-            
-            test_vc = rc4_test.crypt(b'\x00' * 8)  # Use temporary RC4 state for pattern
-            self.console.log(f"[cyan]Looking for VC pattern: {test_vc.hex()}")
+            # === 5) Receive ENCRYPT(VC, crypto_select, PadD, IB)
+            # First, search for encrypted VC pattern; read 14 bytes: VC(8), crypto_select(4), len(PadD)(2)
+            header = self.recv_exactly(s, 14)
+            if not header:
+                raise RuntimeError("No data for VC/crypto_select/PadD_len")
 
-            # Read initial chunk to search for pattern
-            initial_data = self.recv_exactly(s, 96)  # Read a larger initial chunk
-            if not initial_data:
-                raise RuntimeError("Connection closed")
+            decrypted_header = rc4_in.crypt(header)
+            VC_recv = decrypted_header[:8]
+            crypto_select = decrypted_header[8:12]
+            PadD_len = int.from_bytes(decrypted_header[12:14], 'big')
 
-            search_buffer = bytearray(initial_data)
-            pattern_pos = -1
+            # verify VC
+            if VC_recv != b'\x00'*8:
+                raise RuntimeError("VC mismatch after decrypt")
 
-            # Search in initial data
-            for i in range(len(search_buffer) - 7):
-                if search_buffer[i:i+8] == test_vc:
-                    pattern_pos = i
-                    break
+            # verify if it's offered RC4 or plaintext
+            chosen = int.from_bytes(crypto_select, 'big') & 0x03
+            if chosen & 0x02:
+                # continue with RC4
+                self.console.log("[green]Peer chose RC4 encryption[/]")
+            elif chosen & 0x01:
+                # Plaintext chosen
+                self.console.log("[yellow]Peer chose Plaintext. Disabling RC4 from now on.[/]")
+                rc4_in = None
+                rc4_out = None
+            else:
+                raise RuntimeError("No supported encryption method offered")
 
-            # If not found, keep reading until we find it or hit limit
-            while pattern_pos == -1 and len(search_buffer) < 616:
-                chunk = s.recv(1)
-                if not chunk:
-                    raise RuntimeError("Connection closed while searching for VC")
-                search_buffer.extend(chunk)
+            # --- check PadD length ---
+            MAX_PADD_LEN = 2048  # or 512, I think it could be 512
+            if PadD_len > MAX_PADD_LEN:
+                self.console.log(f"[yellow]PadD length is {PadD_len}, which is over our max {MAX_PADD_LEN} -> fallback to plain handshake[/]")
                 
-                if len(search_buffer) >= 8:
-                    for i in range(max(0, len(search_buffer) - 8 - 1), len(search_buffer) - 7):
-                        if search_buffer[i:i+8] == test_vc:
-                            pattern_pos = i
-                            break
+                return None
 
-            if pattern_pos == -1:
-                raise RuntimeError("Could not find VC pattern")
+            # if PadD_len is good, continue
+            PadD_data = self.recv_exactly(s, PadD_len)
+            if not PadD_data:
+                raise RuntimeError("Failed to read PadD data")
+            if rc4_in:
+                rc4_in.crypt(PadD_data)  # unencrypt and discart
 
-            self.console.log(f"[green]Found VC pattern at position {pattern_pos}!")
+            # read len(IB)
+            IB_len_data = self.recv_exactly(s, 2)
+            if not IB_len_data:
+                raise RuntimeError("Failed to read IB length")
+            if rc4_in:
+                IB_len_data = rc4_in.crypt(IB_len_data)
+            IB_len = int.from_bytes(IB_len_data, 'big')
 
-            # Recreate RC4 state and catch up to current position
-            rc4_in = RC4State(keyB)
-            rc4_in.discard(1024)
-            if pattern_pos > 0:
-                rc4_in.crypt(bytes(pattern_pos))  # Discard bytes before pattern
-
-            # Read complete message: VC(8) + crypto_select(4) + len(PadD)(2)
-            header = search_buffer[pattern_pos:pattern_pos+14]
-            if len(header) < 14:
-                # Read remaining header bytes if needed
-                header += self.recv_exactly(s, 14 - len(header))
-
-            decrypted = rc4_in.crypt(header)
-            VC_recv = decrypted[:8]
-            crypto_select = decrypted[8:12]
-            PadD_len = int.from_bytes(decrypted[12:14], 'big')
-
-            self.console.log(f"[cyan]crypto_select: {crypto_select.hex()}")
-            self.console.log(f"[cyan]PadD length: {PadD_len}")
-
-            # Read and decrypt PadD
-            PadD = self.recv_exactly(s, PadD_len)
-            if PadD:
-                rc4_in.crypt(PadD)  # Discard PadD
-
-            # Read and decrypt IB length (2 bytes)
-            IB_len_bytes = rc4_in.crypt(self.recv_exactly(s, 2))
-            IB_len = int.from_bytes(IB_len_bytes, 'big')
-            self.console.log(f"[cyan]IB length: {IB_len}")
-
-            # Read and decrypt IB
+            # read IB
             IB_data = self.recv_exactly(s, IB_len)
-            self.console.log("[cyan]Received encrypted IB")
-            self.console.log(f"[cyan]Received encrypted IB: {IB_data.hex()}")
-            if not IB_data or len(IB_data) != IB_len:
-                raise RuntimeError(f"Failed to read complete IB (got {len(IB_data) if IB_data else 0} of {IB_len} bytes)")
+            if not IB_data or len(IB_data) < IB_len:
+                raise RuntimeError("Failed to read IB fully")
+            if rc4_in:
+                IB = rc4_in.crypt(IB_data)
+            else:
+                IB = IB_data
 
-            IB = rc4_in.crypt(IB_data)
-            
-            # Verify info_hash in IB
-            if len(IB) < 48:
-                self.console.log(f"[red]IB too short: {len(IB)} bytes")
-                raise RuntimeError("IB message too short")
-
-            received_hash = IB[28:48]
-            self.console.log(f"[cyan]Protocol: {IB[1:20]}")
-            self.console.log(f"[cyan]Expected hash: {info_hash.hex()}")
-            self.console.log(f"[cyan]Received hash: {received_hash.hex()}")
-
-            if received_hash != info_hash:
+            if len(IB) < 48 or IB[28:48] != info_hash:
                 raise RuntimeError("info_hash in IB does not match")
 
-            self.console.log("[green]MSE handshake completed![/]")
-
+            self.console.log("[green]MSE handshake completed successfully![/]")
             return {
                 'rc4_in': rc4_in,
                 'rc4_out': rc4_out,
-                'initial_bt_handshake': IA, # IA is what we sent
-                'peer_bt_handshake': IB    # IB is what we received
+                'initial_bt_handshake': IA,
+                'peer_bt_handshake': IB,
+                'fallback_used': False
             }
 
         except Exception as e:
             self.console.log(f"[red]Error during encrypted handshake: {e}[/]")
-            self.console.log(f"[red]Debug: Exception details: {str(e)}")
             return None
