@@ -258,19 +258,21 @@ class TorrentHandler(HandshakeHandler):
                 s.settimeout(10)
                 s.connect((peer_ip, peer_port))
 
+                result = None
                 # try encrypted handshake first
-                result = self.encrypted_handshake(s, info_hash)
-                if result is not None:
-                    # successful encrypted handshake
-                    rc4_in = result['rc4_in']
-                    rc4_out = result['rc4_out']
-                    
-                    self.console.log(f"[green]Successful encrypted handshake with peer {peer_ip}. Starting communication with peer.[/]")
+                if config.ENABLE_ENCRYPTED:
+                    result = self.encrypted_handshake(s, info_hash)
+                    if result is not None:
+                        # successful encrypted handshake
+                        rc4_in = result['rc4_in']
+                        rc4_out = result['rc4_out']
+                        
+                        self.console.log(f"[green]Successful encrypted handshake with peer {peer_ip}. Starting communication with peer.[/]")
 
-                    # Start communication with peer using encrypted handshake
-                    self.start_peer_communication(s, peer_ip, peer_port, info_hash, rc4_in, rc4_out)
-                    return True
-                else:
+                        # Start communication with peer using encrypted handshake
+                        self.start_peer_communication(s, peer_ip, peer_port, info_hash, rc4_in, rc4_out)
+                        return True
+                if result is None or not config.ENABLE_ENCRYPTED:
                     self.console.log("[yellow]Peer does not support encrypted handshake. Retrying with plain handshake.[/]")
                     s.close()
                     if config.ENABLE_PLAIN: # TODO retry with plain handshake, now disabled to get working encrypted handshake
